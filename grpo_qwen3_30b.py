@@ -103,7 +103,49 @@ def parse_args():
                     help="Use HF generation instead of vLLM (REQUIRED on this stack: "
                          "vLLM 0.11.0 bnb 4-bit fused-MoE kernel crashes at init on "
                          "Ampere). Forgoes vLLM standby-memory behaviour.")
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--generation_batch_size", type=int, default=None,
+                    help="Sequences generated per cycle (batched in ONE generate() "
+                         "call). Larger = higher GPU util on the HF-gen path. Must be "
+                         "divisible by num_generations. Default = num_generations.")
+    ap.add_argument("--wandb", action="store_true",
+                    help="Log metrics to Weights & Biases (report_to=wandb). Prints a "
+                         "wandb.ai run URL at startup. Requires `wandb login` (you are "
+                         "logged in as catherinelee274).")
+    ap.add_argument("--wandb_project", default="grpo-qwen3-30b")
+    ap.add_argument("--fa2", action="store_true",
+                    help="Force attn_implementation=flash_attention_2 (only if a "
+                         "working flash-attn is installed; off by default).")
+    ap.add_argument("--fast", action="store_true",
+                    help="Throughput preset for the HF-gen path: batches many more "
+                         "rollouts in parallel to fill the GPU (KV-cache is tiny on "
+                         "Qwen3 GQA) + shorter completions. Sets num_generations=8, "
+                         "generation_batch_size=16 (2 prompts x 8), micro-batch=2, "
+                         "max_completion_length=384. Override individually as needed.")
     return ap.parse_args()
+
+
+def apply_fast_preset(args):
+    """--fast: fill the idle GPU by batching more rollouts + shorter completions.
+    Only override values the user didn't explicitly set on the CLI."""
+    import sys as _s
+    given = set(a.lstrip("-").split("=")[0] for a in _s.argv[1:])
+    if "num_generations" not in given:
+        args.num_generations = 8
+    if "generation_batch_size" not in given:
+        args.generation_batch_size = 16          # 2 prompts x 8 gens, batched
+    if "per_device_train_batch_size" not in given:
+        args.per_device_train_batch_size = 1     # keep backward cheap; gen is the bottleneck
+    # NOTE: do NOT shorten max_completion_length here. We tried 384 and it
+    # truncated 100% of completions mid-reasoning on the hard dataset
+    # (clipped_ratio=1.0, reward=0, std=0 -> zero GRPO signal). On reasoning
+    # tasks the speed lever is BATCHING (more rollouts/cycle), not shorter
+    # completions. Keep the user's max_completion_length (default 640).
+    print(f"[fast] preset: num_generations={args.num_generations} "
+          f"generation_batch_size={args.generation_batch_size} "
+          f"micro_batch={args.per_device_train_batch_size} "
+          f"max_completion_length={args.max_completion_length} (unchanged)")
+    return args
 
 
 # See grpo_small_moe.py: vLLM cannot serve LoRA on fused MoE experts, so the
@@ -156,6 +198,9 @@ def run_once(args, max_seq_length, max_completion_length, num_generations):
     else:
         print("[gen] HF generation path (vLLM disabled): bypasses the broken "
               "vLLM bnb fused-MoE kernel; standby-memory behaviour NOT exercised.")
+    if args.fa2:
+        load_kwargs["attn_implementation"] = "flash_attention_2"
+        print("[fa2] forcing attn_implementation=flash_attention_2")
     model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
 
     target_modules = ATTN if args.lora_scope == "attn" else ATTN_MLP
@@ -176,10 +221,25 @@ def run_once(args, max_seq_length, max_completion_length, num_generations):
     FastLanguageModel.for_training(model)
 
     dataset = build_dataset(n=args.n_problems)
+
+    # Batch math: generation_batch_size = sequences generated in ONE batched
+    # generate() call (this is what fills the GPU on the HF-gen path). TRL ties
+    # it to micro_batch x gradient_accumulation_steps, so we derive grad_accum.
+    # It must be divisible by both num_generations and the micro-batch.
+    micro_bs = args.per_device_train_batch_size
+    gen_bs = args.generation_batch_size or num_generations  # default: 1 prompt x G
+    assert gen_bs % num_generations == 0, \
+        f"generation_batch_size ({gen_bs}) must be divisible by num_generations ({num_generations})"
+    assert gen_bs % micro_bs == 0, \
+        f"generation_batch_size ({gen_bs}) must be divisible by per_device_train_batch_size ({micro_bs})"
+    grad_accum = gen_bs // micro_bs
+    print(f"[batch] generation_batch_size={gen_bs} (={gen_bs // num_generations} prompts x "
+          f"{num_generations} gens) | micro_batch={micro_bs} | grad_accum={grad_accum}")
+
     cfg_kwargs = dict(
         output_dir="outputs/grpo_qwen3_30b",
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=num_generations,
+        per_device_train_batch_size=micro_bs,
+        gradient_accumulation_steps=grad_accum,
         num_generations=num_generations,
         max_prompt_length=max_prompt_length,
         max_completion_length=max_completion_length,
@@ -191,7 +251,9 @@ def run_once(args, max_seq_length, max_completion_length, num_generations):
         temperature=1.0,
         logging_steps=1,
         save_steps=10_000,
-        report_to="none",
+        report_to=("wandb" if args.wandb else "none"),
+        run_name=(f"qwen3-30b-grpo-G{num_generations}-genbs{args.generation_batch_size or num_generations}"
+                  if args.wandb else None),
         gradient_checkpointing=False,
     )
     if not args.no_vllm:
@@ -218,6 +280,12 @@ def run_once(args, max_seq_length, max_completion_length, num_generations):
     dt = time.time() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1024**3
 
+    # save the trained LoRA adapter
+    save_dir = "outputs/grpo_qwen3_30b/final_lora"
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    print(f"\n[save] LoRA adapter written to {save_dir}")
+
     print("\n########## STAGE 2 RESULTS ##########")
     print(f"FIT config: seq={max_seq_length} compl={max_completion_length} "
           f"G={num_generations}")
@@ -239,6 +307,11 @@ def run_once(args, max_seq_length, max_completion_length, num_generations):
 
 def main():
     args = parse_args()
+    if args.fast:
+        args = apply_fast_preset(args)
+    if args.wandb:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        print(f"[wandb] logging to project '{args.wandb_project}' (run URL prints below)")
     print("\n########## STAGE 2: GRPO on Qwen3-30B-A3B (the real target) ##########")
     preflight_or_abort(local_model=os.path.isdir(args.model))
 
