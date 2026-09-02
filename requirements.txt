@@ -1,0 +1,13 @@
+# Faithful Ultra-RL-stage replica — pinned to the stack validated on the 3090.
+# Install torch FIRST with the CUDA build matching the pod, e.g. on an H100:
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+transformers==4.57.1
+# transformers 4.57 requires huggingface-hub<1.0; hub 1.x breaks it.
+huggingface-hub==0.36.2
+trl==0.24.0
+peft==0.19.1
+datasets==3.6.0
+accelerate==1.11.0
+numpy==2.2.6
+wandb==0.27.2
